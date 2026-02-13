@@ -1,0 +1,110 @@
+<!doctype html>
+<html lang="es">
+
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Compresor Lossless PDF & DOCX</title>
+  <link rel="stylesheet" href="./styles.css" />
+</head>
+
+<body>
+  <div class="app">
+    <header class="header">
+      <div>
+        <h1>Compresor Lossless</h1>
+        <!-- <p>PDF (qpdf) y DOCX (re-empacado ZIP). Sin pérdida de calidad.</p> -->
+      </div>
+      <a class="badge" href="/api/health" target="_blank" rel="noreferrer">Status</a>
+    </header>
+
+    <main class="card">
+      <section id="drop" class="dropzone" aria-label="Zona de carga">
+        <div class="dropzone__icon">⬇️</div>
+        <div class="dropzone__text">
+          <strong>Arrastra y suelta</strong> tu archivo aquí
+          <span>o</span>
+          <label class="btn" for="file">Seleccionar archivo</label>
+          <input id="file" type="file" accept=".pdf,.docx" hidden />
+        </div>
+        <div class="hint">Soporta: .pdf y .docx • Máx: 200MB</div>
+      </section>
+
+      <section class="panel">
+        <div class="row">
+          <div class="meta">
+            <div class="label">Archivo</div>
+            <div id="fileName" class="value">—</div>
+          </div>
+          <div class="meta">
+            <div class="label">Tamaño</div>
+            <div id="fileSize" class="value">—</div>
+          </div>
+        </div>
+
+        <div class="progress-wrap">
+          <div class="progress">
+            <div id="progressBar" class="progress__bar"></div>
+          </div>
+          <div id="progressText" class="progress-text">0%</div>
+        </div>
+        <div class="levels">
+          <div class="label">Nivel de compresión</div>
+          <div class="choices">
+            <label class="choice">
+              <input type="radio" name="level" value="min" checked />
+              <span>Mínima</span>
+            </label>
+
+            <label class="choice">
+              <input type="radio" name="level" value="medium" />
+              <span>Media</span>
+            </label>
+
+            <label class="choice">
+              <input type="radio" name="level" value="high" />
+              <span>Alta</span>
+            </label>
+          </div>
+          <div class="hint">
+            Nota: Media/Alta pueden bajar ligeramente la calidad visual en PDFs con imágenes.
+          </div>
+        </div>
+
+        <div class="actions">
+          <button id="btnCompress" class="btn btn-primary" disabled>Comprimir</button>
+          <button id="btnReset" class="btn btn-ghost" disabled>Limpiar</button>
+        </div>
+
+        <div id="result" class="result" hidden>
+          <div class="result__grid">
+            <div class="stat">
+              <div class="label">Original</div>
+              <div id="origHuman" class="value">—</div>
+            </div>
+            <div class="stat">
+              <div class="label">Comprimido</div>
+              <div id="compHuman" class="value">—</div>
+            </div>
+            <div class="stat">
+              <div class="label">Ahorro</div>
+              <div id="savedHuman" class="value">—</div>
+            </div>
+          </div>
+
+          <a id="download" class="btn btn-success" download>Descargar comprimido</a>
+        </div>
+
+        <div id="error" class="error" hidden></div>
+
+        <footer class="note">
+          Nota: al ser <b>sin pérdida</b>, algunos archivos ya optimizados pueden reducir poco.
+        </footer>
+      </section>
+    </main>
+  </div>
+
+  <script src="./app.js"></script>
+</body>
+
+</html>

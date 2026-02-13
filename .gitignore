@@ -1,0 +1,46 @@
+# === Dependencias ===
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# === Variables de entorno / secretos ===
+.env
+.env.*
+!.env.example
+
+# === Temporales de tu app (subidas y salidas) ===
+tmp/
+tmp/**
+
+# Por si en el futuro separas estas carpetas fuera de tmp/
+uploads/
+out/
+
+# === Logs ===
+logs/
+*.log
+
+# === Coverage / tests ===
+coverage/
+.nyc_output/
+
+# === Builds / caches ===
+dist/
+build/
+.cache/
+.eslintcache
+*.tsbuildinfo
+
+# === Sistema / editor ===
+.DS_Store
+Thumbs.db
+desktop.ini
+
+.vscode/
+.idea/
+*.swp
+
+# === GitHub Copilot / misc ===
+*.orig
