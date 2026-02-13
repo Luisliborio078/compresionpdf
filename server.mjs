@@ -18,8 +18,10 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const app = express();
-const PORT = process.env.PORT || 3000;
+const PORT = Number(process.env.PORT || 3000);
+const IS_PROD = process.env.NODE_ENV === "production";
 
+/** ============= Carpetas temporales ============= */
 const TMP_DIR = path.join(__dirname, "tmp");
 const UPLOAD_DIR = path.join(TMP_DIR, "uploads");
 const OUT_DIR = path.join(TMP_DIR, "out");
@@ -28,24 +30,39 @@ for (const dir of [TMP_DIR, UPLOAD_DIR, OUT_DIR]) {
   fs.mkdirSync(dir, { recursive: true });
 }
 
-/** =========================
- * Seguridad base / proxy
- * ========================= */
-app.set("trust proxy", 1); // Render/Reverse proxy
+/** ============= Seguridad base (OWASP) ============= */
+app.set("trust proxy", 1);
 app.disable("x-powered-by");
 
-// HTTPS redirect (solo prod)
+// HTTPS redirect (solo prod y si viene por proxy)
 app.use((req, res, next) => {
   const proto = req.get("x-forwarded-proto");
-  if (process.env.NODE_ENV === "production" && proto && proto !== "https") {
+  if (IS_PROD && proto && proto !== "https") {
     return res.redirect(301, `https://${req.get("host")}${req.originalUrl}`);
   }
   next();
 });
 
-// Headers + logs
-app.use(helmet({ crossOriginResourcePolicy: false }));
-app.use(morgan(process.env.NODE_ENV === "production" ? "combined" : "dev"));
+// Helmet + CSP conservadora (no rompe tu app)
+app.use(
+  helmet({
+    crossOriginResourcePolicy: false,
+    contentSecurityPolicy: {
+      useDefaults: true,
+      directives: {
+        "default-src": ["'self'"],
+        "script-src": ["'self'"],
+        "style-src": ["'self'", "'unsafe-inline'"], // por si usas styles inline
+        "img-src": ["'self'", "data:"],
+        "connect-src": ["'self'"],
+        "frame-ancestors": ["'none'"],
+      },
+    },
+    referrerPolicy: { policy: "no-referrer" },
+  })
+);
+
+app.use(morgan(IS_PROD ? "combined" : "dev"));
 
 /** Rate limit global */
 app.use(
@@ -57,7 +74,7 @@ app.use(
   })
 );
 
-/** Rate limit más estricto para compresión */
+/** Rate limit estricto para compresión */
 const compressLimiter = rateLimit({
   windowMs: 60 * 1000,
   limit: 12,
@@ -65,9 +82,7 @@ const compressLimiter = rateLimit({
   legacyHeaders: false,
 });
 
-/** =========================
- * Opcional: Token de acceso
- * ========================= */
+/** (Opcional) Token para evitar abuso público */
 const API_TOKEN = process.env.API_TOKEN || "";
 app.use("/api", (req, res, next) => {
   if (!API_TOKEN) return next();
@@ -76,22 +91,10 @@ app.use("/api", (req, res, next) => {
   next();
 });
 
-/** =========================
- * Servir frontend (sin caché en DEV)
- * ========================= */
-app.use(
-  express.static(path.join(__dirname, "public"), {
-    maxAge: process.env.NODE_ENV === "production" ? "1h" : 0,
-    etag: process.env.NODE_ENV === "production",
-  })
-);
+/** Servir frontend */
+app.use(express.static(path.join(__dirname, "public"), { maxAge: "1h" }));
 
-/** =========================
- * Upload seguro (multer)
- * ========================= */
-const MAX_FILE_SIZE = Number(process.env.MAX_FILE_SIZE || 200) * 1024 * 1024;
-const allowedExt = new Set([".pdf", ".docx"]);
-
+/** ============= Utils ============= */
 function safeUnlink(p) {
   try {
     fs.unlinkSync(p);
@@ -113,6 +116,29 @@ function sanitizeFilename(name) {
   return name.replace(/[^\w.\-]+/g, "_").slice(0, 140);
 }
 
+/** Runner seguro: execFile + timeout + captura */
+async function run(cmd, args, { timeoutMs = 90_000 } = {}) {
+  try {
+    const { stdout, stderr } = await execFileAsync(cmd, args, {
+      timeout: timeoutMs,
+      windowsHide: true,
+      maxBuffer: 10 * 1024 * 1024,
+    });
+    return { stdout: String(stdout || ""), stderr: String(stderr || "") };
+  } catch (e) {
+    const out = e?.stdout ? String(e.stdout) : "";
+    const err = e?.stderr ? String(e.stderr) : "";
+    const timedOut = Boolean(e?.killed) || e?.code === "ETIMEDOUT";
+    const meta = timedOut ? `TIMEOUT ${timeoutMs}ms` : `code=${e?.code ?? "?"}`;
+    const detail = (err || out || "").trim();
+    throw new Error(`${cmd} falló (${meta}). ${detail}`.trim());
+  }
+}
+
+/** ============= Upload seguro (multer) ============= */
+const MAX_FILE_SIZE = Number(process.env.MAX_FILE_SIZE || 50) * 1024 * 1024; // MB
+const allowedExt = new Set([".pdf", ".docx"]);
+
 const upload = multer({
   dest: UPLOAD_DIR,
   limits: { fileSize: MAX_FILE_SIZE, files: 1 },
@@ -123,110 +149,93 @@ const upload = multer({
   },
 });
 
-/** =========================
- * Runner seguro: execFile + timeout
- * ========================= */
-async function run(cmd, args, { timeoutMs = 90_000 } = {}) {
+/** Magic bytes (no confía en extensión) */
+async function verifyMagic(inputPath, ext) {
+  const fd = await fs.promises.open(inputPath, "r");
   try {
-    await execFileAsync(cmd, args, {
-      timeout: timeoutMs,
-      windowsHide: true,
-      maxBuffer: 1024 * 1024,
-    });
-  } catch (e) {
-    if (e?.code === "ENOENT") {
-      throw new Error(`No se encontró el ejecutable: ${cmd}. Configura la ruta o instala la herramienta.`);
+    const buf = Buffer.alloc(4);
+    await fd.read(buf, 0, 4, 0);
+
+    if (ext === ".pdf" && buf.toString("utf8") !== "%PDF") {
+      throw new Error("El archivo no parece un PDF válido.");
     }
-    const stderr = e?.stderr ? String(e.stderr) : "";
-    throw new Error(`${cmd} falló. ${stderr}`.trim());
+    if (ext === ".docx" && (buf[0] !== 0x50 || buf[1] !== 0x4b)) {
+      throw new Error("El archivo no parece un DOCX válido.");
+    }
+  } finally {
+    await fd.close();
   }
 }
 
-/** =========================
- * QPDF (PDF lossless)
- * ========================= */
-const QPDF_WIN_DEFAULT = "C:\\Program Files\\qpdf 12.2.0\\bin\\qpdf.exe";
-const QPDF_BIN = process.env.QPDF_PATH || (process.platform === "win32" ? QPDF_WIN_DEFAULT : "qpdf");
+/** ============= Concurrencia limitada (anti DoS) ============= */
+const MAX_CONCURRENT_COMPRESS = Number(process.env.MAX_CONCURRENT_COMPRESS || 1);
+let currentCompress = 0;
 
-if (process.platform === "win32" && !fs.existsSync(QPDF_BIN)) {
-  console.warn("⚠️ No se encontró QPDF en:", QPDF_BIN);
-  console.warn("👉 Configura QPDF_PATH o agrega QPDF al PATH.");
-} else {
-  console.log("QPDF_BIN =>", QPDF_BIN);
-}
+/** ============= PDF: QPDF (lossless) ============= */
+const QPDF_WIN_DEFAULT = "C:\\Program Files\\qpdf 12.2.0\\bin\\qpdf.exe";
+const QPDF_BIN =
+  process.env.QPDF_PATH || (process.platform === "win32" ? QPDF_WIN_DEFAULT : "qpdf");
 
 async function compressPdfLossless(inputPath, outputPath) {
   await run(
     QPDF_BIN,
-    ["--object-streams=generate", "--stream-data=compress", "--compression-level=9", inputPath, outputPath],
-    { timeoutMs: 90_000 }
+    [
+      "--object-streams=generate",
+      "--stream-data=compress",
+      "--compression-level=9",
+      inputPath,
+      outputPath,
+    ],
+    { timeoutMs: 120_000 }
   );
 }
 
-/** =========================
- * Ghostscript (PDF con pérdida controlada)
- * ========================= */
-const GS_BIN = process.env.GS_PATH || (process.platform === "win32" ? "gswin64c.exe" : "gs");
+/** ============= PDF: Ghostscript (lossy controlado) ============= */
+const GS_BIN =
+  process.env.GS_PATH || (process.platform === "win32" ? "gswin64c.exe" : "gs");
 
-// perfil más agresivo (más parecido a iLovePDF)
-const GS_PROFILE = {
-  medium: { preset: "/ebook", color: 150, gray: 150, mono: 300 },
-  high: { preset: "/screen", color: 96, gray: 96, mono: 200 },
+const PDF_LEVELS = {
+  min: { engine: "qpdf" },
+  medium: { engine: "gs", preset: "/ebook", dpi: 150, timeoutMs: 300_000 },
+  high: { engine: "gs", preset: "/screen", dpi: 96, timeoutMs: 300_000 },
 };
 
-async function compressPdfWithGhostscript(inputPath, outputPath, level) {
-  const cfg = GS_PROFILE[level];
-  if (!cfg) throw new Error("Nivel inválido para Ghostscript.");
-
+async function compressPdfWithGhostscript(inputPath, outputPath, preset, dpi, timeoutMs) {
   await run(
     GS_BIN,
     [
       "-sDEVICE=pdfwrite",
       "-dCompatibilityLevel=1.4",
-      `-dPDFSETTINGS=${cfg.preset}`,
+      `-dPDFSETTINGS=${preset}`,
       "-dNOPAUSE",
       "-dBATCH",
-      "-dQUIET",
       "-dSAFER",
       "-dDetectDuplicateImages=true",
       "-dCompressFonts=true",
       "-dSubsetFonts=true",
 
-      // Downsample explícito
+      // Downsample real (para bajar MB de verdad)
       "-dDownsampleColorImages=true",
       "-dDownsampleGrayImages=true",
       "-dDownsampleMonoImages=true",
       "-dColorImageDownsampleType=/Bicubic",
       "-dGrayImageDownsampleType=/Bicubic",
-      "-dMonoImageDownsampleType=/Bicubic",
-      `-dColorImageResolution=${cfg.color}`,
-      `-dGrayImageResolution=${cfg.gray}`,
-      `-dMonoImageResolution=${cfg.mono}`,
+      "-dMonoImageDownsampleType=/Subsample",
+      `-dColorImageResolution=${dpi}`,
+      `-dGrayImageResolution=${dpi}`,
+      "-dMonoImageResolution=300",
+
+      // Si el PDF tiene problemas, mejor que lo diga
+      "-dPDFSTOPONERROR",
 
       `-sOutputFile=${outputPath}`,
       inputPath,
     ],
-    { timeoutMs: 180_000 }
+    { timeoutMs }
   );
 }
 
-async function compressPdfByLevel(inputPath, outputPath, level, tempFiles) {
-  if (level === "min") {
-    await compressPdfLossless(inputPath, outputPath);
-    return;
-  }
-
-  // Ghostscript -> (opcional) qpdf para “limpiar” y optimizar un poco más
-  const gsTmp = path.join(OUT_DIR, `${Date.now()}-${crypto.randomUUID()}-gs.pdf`);
-  tempFiles.push(gsTmp);
-
-  await compressPdfWithGhostscript(inputPath, gsTmp, level);
-  await compressPdfLossless(gsTmp, outputPath);
-}
-
-/** =========================
- * DOCX lossless + anti zip-bomb
- * ========================= */
+/** ============= DOCX: recompress ZIP + anti zip-bomb ============= */
 const MAX_DOCX_ENTRIES = Number(process.env.MAX_DOCX_ENTRIES || 5000);
 const MAX_DOCX_UNCOMPRESSED = Number(process.env.MAX_DOCX_UNCOMPRESSED || 300) * 1024 * 1024;
 
@@ -243,9 +252,13 @@ async function recompressDocxLossless(inputPath, outputPath) {
 
   let total = 0;
   for (const f of dir.files) {
-    if (isSuspiciousZipPath(f.path)) throw new Error("DOCX sospechoso (rutas internas inválidas).");
+    if (isSuspiciousZipPath(f.path)) {
+      throw new Error("DOCX sospechoso (rutas internas inválidas).");
+    }
     total += Number(f.uncompressedSize || 0);
-    if (total > MAX_DOCX_UNCOMPRESSED) throw new Error("DOCX sospechoso (tamaño descomprimido excesivo).");
+    if (total > MAX_DOCX_UNCOMPRESSED) {
+      throw new Error("DOCX sospechoso (tamaño descomprimido excesivo).");
+    }
   }
 
   await new Promise((resolve, reject) => {
@@ -271,33 +284,7 @@ async function recompressDocxLossless(inputPath, outputPath) {
   });
 }
 
-/** =========================
- * Validación por magic bytes
- * ========================= */
-async function verifyMagic(inputPath, ext) {
-  const fd = await fs.promises.open(inputPath, "r");
-  try {
-    const buf = Buffer.alloc(4);
-    await fd.read(buf, 0, 4, 0);
-
-    if (ext === ".pdf" && buf.toString("utf8") !== "%PDF") {
-      throw new Error("El archivo no parece un PDF válido.");
-    }
-
-    if (ext === ".docx" && (buf[0] !== 0x50 || buf[1] !== 0x4b)) {
-      throw new Error("El archivo no parece un DOCX válido.");
-    }
-  } finally {
-    await fd.close();
-  }
-}
-
-/** =========================
- * Concurrencia limitada
- * ========================= */
-const MAX_CONCURRENT_COMPRESS = Number(process.env.MAX_CONCURRENT_COMPRESS || 2);
-let currentCompress = 0;
-
+/** ============= API ============= */
 app.get("/api/health", (_req, res) => res.json({ ok: true }));
 
 app.post("/api/compress", compressLimiter, upload.single("file"), async (req, res) => {
@@ -311,35 +298,27 @@ app.post("/api/compress", compressLimiter, upload.single("file"), async (req, re
     return res.status(415).json({ error: "Solo se soporta PDF y DOCX." });
   }
 
-  // Nivel (min | medium | high) - viene en multipart (multer lo coloca en req.body)
-  const requested = String(req.body?.level || "min").toLowerCase();
-  const level = ["min", "medium", "high"].includes(requested) ? requested : "min";
-
-  // Debug útil para confirmar
-  if (process.env.NODE_ENV !== "production") {
-    console.log("Nivel recibido:", req.body?.level, "-> nivel usado:", level);
-  }
-
   if (currentCompress >= MAX_CONCURRENT_COMPRESS) {
     safeUnlink(req.file.path);
-    return res.status(503).json({ error: "Servidor ocupado. Intenta nuevamente en unos segundos." });
+    return res.status(503).json({ error: "Servidor ocupado. Intenta nuevamente." });
   }
 
   currentCompress++;
 
   const inputPath = req.file.path;
-  const safeName = sanitizeFilename(`${path.basename(originalName, ext)}.compressed${ext}`);
-  const outputPath = path.join(OUT_DIR, `${Date.now()}-${crypto.randomUUID()}-${safeName}`);
 
-  const tempFiles = []; // temporales extra (ghostscript)
+  const levelRaw = String(req.body?.level || "min").toLowerCase();
+  const level = PDF_LEVELS[levelRaw] ? levelRaw : "min";
+
+  const outBase = sanitizeFilename(`${path.basename(originalName, ext)}.compressed${ext}`);
+  const outputPath = path.join(OUT_DIR, `${Date.now()}-${crypto.randomUUID()}-${outBase}`);
+
   let cleaned = false;
-
   const cleanupOnce = () => {
     if (cleaned) return;
     cleaned = true;
     safeUnlink(inputPath);
     safeUnlink(outputPath);
-    for (const p of tempFiles) safeUnlink(p);
     currentCompress = Math.max(0, currentCompress - 1);
   };
 
@@ -348,10 +327,38 @@ app.post("/api/compress", compressLimiter, upload.single("file"), async (req, re
 
     const before = fs.statSync(inputPath).size;
 
+    // PDF
     if (ext === ".pdf") {
-      await compressPdfByLevel(inputPath, outputPath, level, tempFiles);
-    } else {
+      const cfg = PDF_LEVELS[level];
+
+      if (cfg.engine === "qpdf") {
+        await compressPdfLossless(inputPath, outputPath);
+        res.setHeader("X-Engine", "qpdf");
+      } else {
+        try {
+          await compressPdfWithGhostscript(
+            inputPath,
+            outputPath,
+            cfg.preset,
+            cfg.dpi,
+            cfg.timeoutMs
+          );
+          res.setHeader("X-Engine", "ghostscript");
+        } catch (e) {
+          // fallback seguro
+          console.error("[GS ERROR]", e.message);
+          safeUnlink(outputPath);
+          await compressPdfLossless(inputPath, outputPath);
+          res.setHeader("X-Engine", "qpdf-fallback");
+          res.setHeader("X-Warn", String(e.message).slice(0, 200));
+        }
+      }
+    }
+
+    // DOCX
+    if (ext === ".docx") {
       await recompressDocxLossless(inputPath, outputPath);
+      res.setHeader("X-Engine", "docx-zip");
     }
 
     const after = fs.statSync(outputPath).size;
@@ -359,16 +366,15 @@ app.post("/api/compress", compressLimiter, upload.single("file"), async (req, re
 
     res.setHeader("Cache-Control", "no-store");
 
-    // Métricas + debug
+    // Métricas
     res.setHeader("X-Original-Bytes", String(before));
     res.setHeader("X-Compressed-Bytes", String(after));
     res.setHeader("X-Saved-Bytes", String(saved));
     res.setHeader("X-Original-Human", bytesToHuman(before));
     res.setHeader("X-Compressed-Human", bytesToHuman(after));
-    res.setHeader("X-Level", level);
-    res.setHeader("X-Engine", ext === ".pdf" ? (level === "min" ? "qpdf" : "ghostscript+qpdf") : "docx-zip");
 
-    res.setHeader("Content-Disposition", `attachment; filename="${safeName}"`);
+    // Descarga
+    res.setHeader("Content-Disposition", `attachment; filename="${outBase}"`);
     res.setHeader(
       "Content-Type",
       ext === ".pdf"
@@ -382,15 +388,18 @@ app.post("/api/compress", compressLimiter, upload.single("file"), async (req, re
     res.on("finish", cleanupOnce);
     res.on("close", cleanupOnce);
   } catch (e) {
+    console.error("[COMPRESS ERROR]", e.message);
     cleanupOnce();
-    const msg =
-      ext === ".pdf"
-        ? `Error al comprimir PDF (${level}). Detalle: ${e.message}`
-        : `Error al comprimir DOCX. Detalle: ${e.message}`;
-    return res.status(500).json({ error: msg });
+
+    // Mensaje seguro al cliente
+    const safeMsg = IS_PROD
+      ? "No se pudo procesar el archivo. Intenta con otro o más tarde."
+      : `No se pudo procesar el archivo. Detalle: ${e.message}`;
+
+    return res.status(500).json({ error: safeMsg });
   }
 });
 
 app.listen(PORT, "0.0.0.0", () => {
-  console.log(`✅ App corriendo en http://localhost:${PORT}`);
+  console.log(`✅ App corriendo en puerto ${PORT}`);
 });

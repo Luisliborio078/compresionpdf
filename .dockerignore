@@ -2,5 +2,11 @@ node_modules
 tmp
 .git
 .vscode
-.DS_Store
-npm-debug.log
+.env
+.env.*
+npm-debug.log*
+yarn.lock
+pnpm-lock.yaml
+Dockerfile
+docker-compose.yml
+README.md
